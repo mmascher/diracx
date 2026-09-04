@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import shutil
 import tempfile
 from datetime import UTC, datetime
 
@@ -402,27 +403,47 @@ class CondorJobExecutorTask(BaseTask):
         extracted_jdl = _jdl_to_key_value_pairs(extracted_jdl)
         submit_description = _jdl_dict_to_submit_description(extracted_jdl)
 
+        logger.info(f"HTCondor Python bindings module: {htcondor2.__file__}")
+        logger.info(
+            f"HTCondor Python bindings version: {getattr(htcondor2, 'version', lambda: 'unknown')()}"
+        )
+
         htcondor2.set_subsystem("TOOL")
-        htcondor2.param["TOOL_DEBUG"] = "D_FULLDEBUG"
+        htcondor2.param["TOOL_DEBUG"] = "D_FULLDEBUG,D_SECURITY"
+        htcondor2.param["TOOL_LOG_LEVEL"] = "DEBUG"
         htcondor2.param["TOOL_LOG"] = f"{tempfile.gettempdir()}/htcondor-python.log"
         htcondor2.enable_log()
 
-        collector = htcondor2.Collector(collector_host)
+        security_context = htcondor2.SecurityContext(token=os.environ["CONDOR_TOKEN"])
+
+        collector = htcondor2.Collector(collector_host, security=security_context)
         schedd_ad = collector.locate(htcondor2.DaemonTypes.Schedd, schedd_name)
         if not schedd_ad:
             raise RuntimeError(
                 f"Could not locate schedd '{schedd_name}' via collector '{collector_host}'"
             )
 
-        token = htcondor2.Token(os.environ["CONDOR_TOKEN"])
-        htcondor2.setToken(token)
+        # htcondor2.Schedd doesn't accept a SecurityContext (unlike Collector), so
+        # the token must be dropped on disk for it to be picked up via SEC_TOKEN_DIRECTORY.
+        # See https://groups.google.com/a/g-groups.wisc.edu/d/msgid/htcondor-users/ZR3P278MB1259A4C86E46C96715FE6BE792B52%40ZR3P278MB1259.CHEP278.PROD.OUTLOOK.COM?utm_medium=email&utm_source=footer
+        token_dir = tempfile.mkdtemp(prefix="condor-tokens-")
+        try:
+            token_path = os.path.join(token_dir, "dirac.token")
+            with open(token_path, "w") as token_file:
+                token_file.write(os.environ["CONDOR_TOKEN"])
+            os.chmod(token_path, 0o600)
+            htcondor2.param["SEC_TOKEN_DIRECTORY"] = token_dir
 
-        schedd = htcondor2.Schedd(schedd_ad)
-        submit = htcondor2.Submit(submit_description)
-        result = schedd.submit(submit, spool=True)
-        schedd.spool(result)
+            schedd = htcondor2.Schedd(schedd_ad)
+            submit = htcondor2.Submit(submit_description)
+            result = schedd.submit(submit, spool=True)
+            schedd.spool(result)
+        finally:
+            shutil.rmtree(token_dir, ignore_errors=True)
         cluster_id = result.cluster()
-
+        logger.info(
+            f"Job {self.job_id} submitted to HTCondor with cluster ID {cluster_id}"
+        )
         return CondorSubmitResult(
             cluster_id=int(cluster_id),
             proc_id=0,
