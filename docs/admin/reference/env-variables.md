@@ -372,30 +372,10 @@ A JSON-encoded dictionary of headers to pass to the OpenTelemetry collector, e.g
 
 ## Tasks
 
-## CondorJobExecutorSettings
+**Error: Class 'CondorJobExecutorSettings' not found in diracx.core.settings**
 
-Settings controlling automatic Condor job submission.
+Available classes: ServiceSettingsBase, DevelopmentSettings, AuthSettings, SandboxStoreSettings, FactorySettings, OTELSettings
 
-### `DIRACX_TASKS_CONDOR_JOB_EXECUTOR_ENABLED`
+**Error: Class 'DummyJobExecutorSettings' not found in diracx.core.settings**
 
-*Optional*, default value: `False`
-
-Whether the monitor is scheduled automatically.
-
-### `DIRACX_TASKS_CONDOR_JOB_EXECUTOR_INTERVAL_SECONDS`
-
-*Optional*, default value: `10`
-
-How often the enabled monitor searches for received jobs.
-
-### `DIRACX_TASKS_CONDOR_JOB_EXECUTOR_SCHEDD_NAME`
-
-*Optional*, default value: `default`
-
-Logical name of the target HTCondor schedd.
-
-### `DIRACX_TASKS_CONDOR_JOB_EXECUTOR_COLLECTOR_HOST`
-
-*Optional*, default value: `None`
-
-Optional collector host used to resolve the target schedd.
+Available classes: ServiceSettingsBase, DevelopmentSettings, AuthSettings, SandboxStoreSettings, FactorySettings, OTELSettings

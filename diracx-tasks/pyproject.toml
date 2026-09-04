@@ -30,6 +30,7 @@ dynamic = ["version"]
 testing = ["diracx-testing", "fakeredis"]
 
 [project.scripts]
+diracx-tasks = "diracx.tasks.task_run:main"
 diracx-task-run = "diracx.tasks.task_run:main"
 
 [project.entry-points."diracx.dbs.sql"]
@@ -39,6 +40,8 @@ TaskDB = "diracx.tasks.plumbing.persistence:TaskDB"
 CleanSandboxStoreTask = "diracx.tasks.jobs:CleanSandboxStoreTask"
 CondorJobExecutorMonitorTask = "diracx.tasks.jobs:CondorJobExecutorMonitorTask"
 CondorJobExecutorTask = "diracx.tasks.jobs:CondorJobExecutorTask"
+DummyJobExecutorMonitorTask = "diracx.tasks.jobs:DummyJobExecutorMonitorTask"
+DummyJobExecutorTask = "diracx.tasks.jobs:DummyJobExecutorTask"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

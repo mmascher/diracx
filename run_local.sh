@@ -65,6 +65,7 @@ function wait_for_service() {
 }
 
 function redis_ready() { redis-cli -p 6379 ping 2>/dev/null | grep -q PONG; }
+function diracx_ready() { curl --silent --show-error --fail --output /dev/null --max-time 2 http://localhost:8000/api/health/ready; }
 
 # Make a keystore
 keystore="${tmp_dir}/keystore/jwks.json"
@@ -98,6 +99,8 @@ export DIRACX_SANDBOX_STORE_BUCKET_NAME=sandboxes
 export DIRACX_SANDBOX_STORE_AUTO_CREATE_BUCKET=true
 export DIRACX_SANDBOX_STORE_S3_CLIENT_KWARGS='{"endpoint_url": "http://localhost:8333", "aws_access_key_id": "console", "aws_secret_access_key": "console123"}'
 export DIRACX_TASKS_REDIS_URL="redis://localhost:6379"
+export DIRACX_TASKS_DUMMY_JOB_EXECUTOR_ENABLED=true
+export DIRACX_TASKS_DUMMY_JOB_EXECUTOR_INTERVAL_SECONDS=10
 
 # Write all DIRACX env vars to a sourceable file for use in other terminals
 script_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -172,21 +175,21 @@ fi
 # Start application services
 uvicorn --factory diracx.testing.routers:create_app --reload > "${tmp_dir}/logs/uvicorn.log" 2>&1 &
 diracx_pid=$!
-diracx-task-run scheduler > "${tmp_dir}/logs/scheduler.log" 2>&1 &
+diracx-tasks scheduler > "${tmp_dir}/logs/scheduler.log" 2>&1 &
 scheduler_pid=$!
-diracx-task-run worker --worker-size small --max-concurrent-tasks 3 > "${tmp_dir}/logs/worker-sm.log" 2>&1 &
+diracx-tasks worker --worker-size small --max-concurrent-tasks 3 > "${tmp_dir}/logs/worker-sm.log" 2>&1 &
 worker_small_pid=$!
 if [[ "${DIRACX_DEBUG:-0}" == "1" ]]; then
   echo "🐛 Starting medium worker with debugpy on port 5678"
   python -m debugpy --listen 5678 \
-    "$(which diracx-task-run)" worker --worker-size medium --max-concurrent-tasks 2 \
+    "$(which diracx-tasks)" worker --worker-size medium --max-concurrent-tasks 2 \
     > "${tmp_dir}/logs/worker-md.log" 2>&1 &
 else
-  diracx-task-run worker --worker-size medium --max-concurrent-tasks 2 \
+  diracx-tasks worker --worker-size medium --max-concurrent-tasks 2 \
     > "${tmp_dir}/logs/worker-md.log" 2>&1 &
 fi
 worker_medium_pid=$!
-diracx-task-run worker --worker-size large --max-concurrent-tasks 1 > "${tmp_dir}/logs/worker-lg.log" 2>&1 &
+diracx-tasks worker --worker-size large --max-concurrent-tasks 1 > "${tmp_dir}/logs/worker-lg.log" 2>&1 &
 worker_large_pid=$!
 
 all_pid_names=(seaweedfs redis uvicorn scheduler worker-sm worker-md worker-lg)
@@ -204,10 +207,10 @@ all_commands=(
   "weed mini -dir=${tmp_dir}/seaweedfs -s3.config=${tmp_dir}/seaweedfs_s3.json"
   "redis-server --port 6379 --save \"\" --appendonly no"
   "uvicorn --factory diracx.testing.routers:create_app --reload"
-  "diracx-task-run scheduler"
-  "diracx-task-run worker --worker-size small --max-concurrent-tasks 1"
-  "diracx-task-run worker --worker-size medium --max-concurrent-tasks 1"
-  "diracx-task-run worker --worker-size large --max-concurrent-tasks 1"
+  "diracx-tasks scheduler"
+  "diracx-tasks worker --worker-size small --max-concurrent-tasks 1"
+  "diracx-tasks worker --worker-size medium --max-concurrent-tasks 1"
+  "diracx-tasks worker --worker-size large --max-concurrent-tasks 1"
 )
 all_restart_counts=(0 0 0 0 0 0 0)
 
@@ -223,9 +226,9 @@ function restart_process() {
   all_pid_values[$i]=$!
 }
 
-# Wait for uvicorn
+# Wait for DiracX readiness
 if wait_for_service "uvicorn" "$diracx_pid" "${tmp_dir}/logs/uvicorn.log" \
-     curl --silent --max-time 2 --head http://localhost:8000; then
+     diracx_ready; then
   status_line="✅ DiracX is running on http://localhost:8000"
 else
   status_line="❌ Failed to start DiracX — check ${tmp_dir}/logs/uvicorn.log"
