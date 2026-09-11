@@ -82,7 +82,7 @@ class CondorJobExecutorSettings(ServiceSettingsBase):
     enabled: bool = False
     """Whether the monitor is scheduled automatically."""
 
-    interval_seconds: PositiveInt = 10
+    interval_seconds: PositiveInt = 60  # 1 minute
     """How often the enabled monitor searches for received jobs."""
 
     schedd_name: str = "crab3@vocms059.cern.ch"
@@ -92,7 +92,29 @@ class CondorJobExecutorSettings(ServiceSettingsBase):
     """Optional collector host used to resolve the target schedd."""
 
 
-_settings = CondorJobExecutorSettings()
+class CondorJobStatusCollectorSettings(ServiceSettingsBase):
+    """Settings controlling Condor job status collecting."""
+
+    model_config = ServiceSettingsBase.model_config | {
+        "env_prefix": "DIRACX_TASKS_CONDOR_JOB_STATUS_COLLECTOR_",
+        "use_attribute_docstrings": True,
+    }
+
+    enabled: bool = False
+    """Whether the monitor is scheduled automatically."""
+
+    interval_seconds: PositiveInt = 60 * 10  # 10 minutes
+    """How often the enabled monitor status of submitted HTCondor jobs."""
+
+    schedd_name: str = "crab3@vocms059.cern.ch"
+    """Logical name of the target HTCondor schedd."""
+
+    collector_host: str | None = "vocms4100.cern.ch"
+    """Optional collector host used to resolve the target schedd."""
+
+
+_settingsExecutor = CondorJobExecutorSettings()
+_settingsStatusCollector = CondorJobStatusCollectorSettings()
 
 
 def _jdl_to_key_value_pairs(jdl: str) -> dict[str, str]:
@@ -273,6 +295,29 @@ async def _set_job_statuses_sql_only(
     )
 
 
+def _condor_jobstatus_to_diracx_jobstatus(value: int) -> JobStatus:
+    """
+    Translate HTCondor JobStatus to DiracX JobStatus:
+        HTCondor         DiracX
+        -----------      --------
+        1 = IDLE     ->  WAITING
+        2 = RUNNING  ->  RUNNING
+        3 = FAILED   ->  FAILED
+        4 = DONE     ->  DONE
+        Other        ->  STALLED
+    """
+    if value == 1:
+        return JobStatus.WAITING
+    elif value == 2:
+        return JobStatus.RUNNING
+    elif value == 3:
+        return JobStatus.FAILED
+    elif value == 4:
+        return JobStatus.DONE
+    else:
+        return JobStatus.STALLED
+
+
 @dataclasses.dataclass(frozen=True)
 class CondorSubmitResult:
     cluster_id: int
@@ -286,8 +331,8 @@ class CondorJobExecutorMonitorTask(PeriodicBaseTask):
 
     priority = Priority.BACKGROUND
     size = Size.MEDIUM
-    _enabled = _settings.enabled
-    default_schedule = IntervalSeconds(_settings.interval_seconds)
+    _enabled = _settingsExecutor.enabled
+    default_schedule = IntervalSeconds(_settingsExecutor.interval_seconds)
 
     async def execute(
         self,
@@ -374,8 +419,8 @@ class CondorJobExecutorTask(BaseTask):
         job_db: JobDB,
     ) -> CondorSubmitResult:
         del config
-        schedd_name = _settings.schedd_name
-        collector_host = _settings.collector_host
+        schedd_name = _settingsExecutor.schedd_name
+        collector_host = _settingsExecutor.collector_host
 
         _, jobs = await job_db.search(
             parameters=["JobID"],
@@ -460,11 +505,8 @@ class CondorJobExecutorTask(BaseTask):
     ) -> int:
         logger.info("Submitting job %d to HTCondor", self.job_id)
         submission = await self.submit_to_condor(config=config, job_db=job_db)
-        target = submission.schedd_name or _settings.schedd_name
-        application_status = (
-            f"Submitted to HTCondor schedd {target} as "
-            f"{submission.cluster_id}.{submission.proc_id}"
-        )
+        target = submission.schedd_name or _settingsExecutor.schedd_name
+        application_status = f"{submission.cluster_id}.{submission.proc_id}"
         logger.warning(
             "Applying SQL-only Matched status transition for job %d (OpenSearch disabled)",
             self.job_id,
@@ -500,4 +542,166 @@ class CondorJobExecutorTask(BaseTask):
         #     task_queue_db=task_queue_db,
         #     job_parameters_db=job_parameters_db,
         # )
+        return self.job_id
+
+
+@dataclasses.dataclass
+class CondorJobStatusCollectorMonitorTask(PeriodicBaseTask):
+    """Monitor all jobs HTCondor statuses"""
+
+    priority = Priority.BACKGROUND
+    size = Size.SMALL
+    _enabled = _settingsStatusCollector.enabled
+    default_schedule = IntervalSeconds(_settingsStatusCollector.interval_seconds)
+
+    async def execute(
+        self,
+        config: Config,
+        job_db: JobDB,
+        job_logging_db: JobLoggingDB,
+    ) -> int:
+        _, jobs = await job_db.search(
+            ["JobID"],
+            [],
+            [],
+        )
+        if not jobs:
+            return 0
+
+        job_ids = [job["JobID"] for job in jobs]
+        logger.info("Querying %d received job(s): %s", len(job_ids), job_ids)
+
+        for job_id in job_ids:
+            await CondorJobStatusCollectorTask(job_id=job_id).schedule()
+
+        return len(job_ids)
+
+
+@dataclasses.dataclass
+class CondorJobStatusCollectorTask(BaseTask):
+    """Collect status of HTCondor jobs."""
+
+    job_id: int
+
+    @property
+    def execution_locks(self) -> list[BaseLock]:
+        return [MutexLock(JOB, self.job_id)]
+
+    async def query_from_condor(
+        self,
+        *,
+        job_db: JobDB,
+    ) -> int:
+        schedd_name = _settingsStatusCollector.schedd_name
+        collector_host = _settingsStatusCollector.collector_host
+
+        _, statuses = await job_db.search(
+            parameters=["JobID", "ApplicationStatus"],
+            search=[
+                {
+                    "parameter": "JobID",
+                    "operator": ScalarSearchOperator.EQUAL,
+                    "value": self.job_id,
+                }
+            ],
+            sorts=[],
+        )
+        if not statuses:
+            raise ValueError(f"Status not found for job: {self.job_id}")
+
+        # Parse the HTCondor ClusterId.ProcId
+        if statuses[0]["ApplicationStatus"] == "Unknown":
+            return -1
+        else:
+            cluster_id, proc_id = statuses[0]["ApplicationStatus"].split(".")
+
+        # Instantiate HTCondor
+        logger.info(f"HTCondor Python bindings module: {htcondor2.__file__}")
+        logger.info(
+            f"HTCondor Python bindings version: {getattr(htcondor2, 'version', lambda: 'unknown')()}"
+        )
+        htcondor2.set_subsystem("TOOL")
+        htcondor2.param["TOOL_DEBUG"] = "D_FULLDEBUG,D_SECURITY"
+        htcondor2.param["TOOL_LOG_LEVEL"] = "DEBUG"
+        htcondor2.param["TOOL_LOG"] = f"{tempfile.gettempdir()}/htcondor-python.log"
+        htcondor2.enable_log()
+        security_context = htcondor2.SecurityContext(token=os.environ["CONDOR_TOKEN"])
+
+        # Instantiate HTCondor collector and schedd
+        collector = htcondor2.Collector(collector_host, security=security_context)
+        schedd_ad = collector.locate(htcondor2.DaemonTypes.Schedd, schedd_name)
+        if not schedd_ad:
+            raise RuntimeError(
+                f"Could not locate schedd '{schedd_name}' via collector '{collector_host}'"
+            )
+
+        # htcondor2.Schedd doesn't accept a SecurityContext (unlike Collector), so
+        # the token must be dropped on disk for it to be picked up via SEC_TOKEN_DIRECTORY.
+        # See https://groups.google.com/a/g-groups.wisc.edu/d/msgid/htcondor-users/ZR3P278MB1259A4C86E46C96715FE6BE792B52%40ZR3P278MB1259.CHEP278.PROD.OUTLOOK.COM?utm_medium=email&utm_source=footer
+        token_dir = tempfile.mkdtemp(prefix="condor-tokens-")
+        try:
+            token_path = os.path.join(token_dir, "dirac.token")
+            with open(token_path, "w") as token_file:
+                token_file.write(os.environ["CONDOR_TOKEN"])
+            os.chmod(token_path, 0o600)
+            htcondor2.param["SEC_TOKEN_DIRECTORY"] = token_dir
+            schedd = htcondor2.Schedd(schedd_ad)
+            # Query HTCondor status
+            result = schedd.query(
+                constraint=f"ClusterId == {cluster_id} && ProcId == {proc_id}",
+                projection=[
+                    "JobStatus",
+                ],
+            )
+        finally:
+            shutil.rmtree(token_dir, ignore_errors=True)
+        return result[0]["JobStatus"]
+
+    async def execute(
+        self,
+        job_db: JobDB,
+        job_logging_db: JobLoggingDB,
+    ) -> int:
+        logger.info("Querying job %d from HTCondor", self.job_id)
+        condor_status = await self.query_from_condor(job_db=job_db)
+
+        # Only check status for submitted jobs
+        if condor_status > 0:
+            # Translate from HTCondor Status to DiracX JobStatus
+            dirac_status = _condor_jobstatus_to_diracx_jobstatus(condor_status)
+
+            logger.warning(
+                "Applying SQL-only status transition for job %d (OpenSearch disabled)",
+                self.job_id,
+            )
+            await _set_job_statuses_sql_only(
+                job_db=job_db,
+                job_logging_db=job_logging_db,
+                status_changes={
+                    self.job_id: JobStatusUpdate(
+                        Status=dirac_status,
+                        MinorStatus=MINOR_STATUS,
+                        Source=MINOR_STATUS,
+                    )
+                },
+                source=MINOR_STATUS,
+            )
+            # now = datetime.now(UTC)
+            # await set_job_statuses(
+            #     {
+            #         self.job_id: {
+            #             now: JobStatusUpdate(
+            #                 Status=dirac_status,
+            #                 MinorStatus=MINOR_STATUS,
+            #                 Source=MINOR_STATUS,
+            #             )
+            #         }
+            #     },
+            #     config=config,
+            #     job_db=job_db,
+            #     job_logging_db=job_logging_db,
+            #     task_queue_db=task_queue_db,
+            #     job_parameters_db=job_parameters_db,
+            # )
+
         return self.job_id

@@ -40,6 +40,8 @@ TaskDB = "diracx.tasks.plumbing.persistence:TaskDB"
 CleanSandboxStoreTask = "diracx.tasks.jobs:CleanSandboxStoreTask"
 CondorJobExecutorMonitorTask = "diracx.tasks.jobs:CondorJobExecutorMonitorTask"
 CondorJobExecutorTask = "diracx.tasks.jobs:CondorJobExecutorTask"
+CondorJobStatusCollectorMonitorTask = "diracx.tasks.jobs:CondorJobStatusCollectorMonitorTask"
+CondorJobStatusCollectorTask = "diracx.tasks.jobs:CondorJobStatusCollectorTask"
 DummyJobExecutorMonitorTask = "diracx.tasks.jobs:DummyJobExecutorMonitorTask"
 DummyJobExecutorTask = "diracx.tasks.jobs:DummyJobExecutorTask"
 
