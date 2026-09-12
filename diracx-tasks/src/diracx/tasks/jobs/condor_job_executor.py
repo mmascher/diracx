@@ -616,7 +616,10 @@ class CondorJobStatusCollectorTask(BaseTask):
         if application_status == "Unknown":
             return -1
 
-        # Parse the HTCondor ClusterId.ProcId
+        # Parse the HTCondor ClusterId.ProcId. Some legacy jobs have a
+        # human-readable status here instead (e.g. "Submitted to HTCondor
+        # schedd crab3@vocms059.cern.ch as 10610322.0"), which contains
+        # multiple dots and breaks the split below.
         parts = (application_status or "").split(".")
         if len(parts) != 2:
             logger.error(
