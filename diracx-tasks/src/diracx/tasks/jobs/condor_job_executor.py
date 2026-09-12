@@ -296,15 +296,14 @@ async def _set_job_statuses_sql_only(
 
 
 def _condor_jobstatus_to_diracx_jobstatus(value: int) -> JobStatus:
-    """
-    Translate HTCondor JobStatus to DiracX JobStatus:
-        HTCondor         DiracX
-        -----------      --------
-        1 = IDLE     ->  WAITING
-        2 = RUNNING  ->  RUNNING
-        3 = FAILED   ->  FAILED
-        4 = DONE     ->  DONE
-        Other        ->  STALLED
+    """Translate HTCondor JobStatus to DiracX JobStatus:
+    HTCondor         DiracX
+    -----------      --------
+    1 = IDLE     ->  WAITING
+    2 = RUNNING  ->  RUNNING
+    3 = FAILED   ->  FAILED
+    4 = DONE     ->  DONE
+    Other        ->  STALLED
     """
     if value == 1:
         return JobStatus.WAITING
@@ -609,11 +608,28 @@ class CondorJobStatusCollectorTask(BaseTask):
         if not statuses:
             raise ValueError(f"Status not found for job: {self.job_id}")
 
-        # Parse the HTCondor ClusterId.ProcId
-        if statuses[0]["ApplicationStatus"] == "Unknown":
+        application_status = statuses[0]["ApplicationStatus"]
+        logger.info(
+            "Job %d raw ApplicationStatus from DB: %r", self.job_id, application_status
+        )
+
+        if application_status == "Unknown":
             return -1
-        else:
-            cluster_id, proc_id = statuses[0]["ApplicationStatus"].split(".")
+
+        # Parse the HTCondor ClusterId.ProcId
+        parts = (application_status or "").split(".")
+        if len(parts) != 2:
+            logger.error(
+                "Job %d has an unexpected ApplicationStatus format %r "
+                "(expected 'ClusterId.ProcId'), split into %d part(s): %r. "
+                "Treating job status as unknown.",
+                self.job_id,
+                application_status,
+                len(parts),
+                parts,
+            )
+            return -1
+        cluster_id, proc_id = parts
 
         # Instantiate HTCondor
         logger.info(f"HTCondor Python bindings module: {htcondor2.__file__}")
@@ -647,14 +663,32 @@ class CondorJobStatusCollectorTask(BaseTask):
             htcondor2.param["SEC_TOKEN_DIRECTORY"] = token_dir
             schedd = htcondor2.Schedd(schedd_ad)
             # Query HTCondor status
+            constraint = f"ClusterId == {cluster_id} && ProcId == {proc_id}"
+            logger.info(
+                "Job %d querying schedd '%s' with constraint %r",
+                self.job_id,
+                schedd_name,
+                constraint,
+            )
             result = schedd.query(
-                constraint=f"ClusterId == {cluster_id} && ProcId == {proc_id}",
+                constraint=constraint,
                 projection=[
                     "JobStatus",
                 ],
             )
         finally:
             shutil.rmtree(token_dir, ignore_errors=True)
+
+        logger.info("Job %d schedd query result: %r", self.job_id, result)
+        if not result:
+            logger.error(
+                "Job %d not found in schedd '%s' (constraint %r). "
+                "It may have left the queue (completed/removed). Treating as unknown.",
+                self.job_id,
+                schedd_name,
+                constraint,
+            )
+            return -1
         return result[0]["JobStatus"]
 
     async def execute(
