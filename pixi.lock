@@ -22929,6 +22929,7 @@ packages:
   - diracx-db
   - diracx-logic
   - fastapi>=0.121.0
+  - httpx
   - msgpack
   - opentelemetry-api
   - pydantic>=2.10

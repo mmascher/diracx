@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import dataclasses
+import io
 import logging
 import os
 import shutil
+import tarfile
 import tempfile
 from datetime import UTC, datetime
 
 import htcondor2
+import httpx
 from DIRACCommon.WorkloadManagementSystem.DB.JobDBUtils import extractJDL
 from pydantic import PositiveInt
 
@@ -20,9 +23,10 @@ from diracx.core.models import (
     ScalarSearchOperator,
     ScalarSearchSpec,
 )
-from diracx.core.settings import ServiceSettingsBase
+from diracx.core.settings import SandboxStoreSettings, ServiceSettingsBase
 from diracx.db.os import JobParametersDB
 from diracx.db.sql import JobDB, JobLoggingDB, TaskQueueDB
+from diracx.logic.jobs.sandboxes import pfn_to_key
 
 # from diracx.logic.jobs import set_job_statuses
 from diracx.tasks.plumbing.base_task import BaseTask, PeriodicBaseTask
@@ -36,7 +40,6 @@ from diracx.tasks.plumbing.schedules import IntervalSeconds
 logger = logging.getLogger(__name__)
 
 MINOR_STATUS = "CondorExecutor"
-
 DEFAULT_DESIRED_SITES = (
     "T1_DE_KIT",
     "T1_ES_PIC",
@@ -91,6 +94,13 @@ class CondorJobExecutorSettings(ServiceSettingsBase):
     collector_host: str | None = "vocms4100.cern.ch"
     """Optional collector host used to resolve the target schedd."""
 
+    proxy_path: str | None = None
+    """Optional worker-local X.509 proxy for trusted single-user testing.
+
+    If set, this credential is transferred with every job handled by the executor.
+    This is not a per-user credential selection or renewal mechanism.
+    """
+
 
 class CondorJobStatusCollectorSettings(ServiceSettingsBase):
     """Settings controlling Condor job status collecting."""
@@ -113,8 +123,8 @@ class CondorJobStatusCollectorSettings(ServiceSettingsBase):
     """Optional collector host used to resolve the target schedd."""
 
 
-_settingsExecutor = CondorJobExecutorSettings()
-_settingsStatusCollector = CondorJobStatusCollectorSettings()
+_executor_settings = CondorJobExecutorSettings()
+_status_collector_settings = CondorJobStatusCollectorSettings()
 
 
 def _jdl_to_key_value_pairs(jdl: str) -> dict[str, str]:
@@ -196,11 +206,53 @@ def _parse_file_list(value: str) -> list[str]:
     ]
 
 
-def _jdl_dict_to_submit_description(jdl: dict[str, str]) -> str:
+async def _materialise_input_sandbox(
+    entries: list[str], settings: SandboxStoreSettings, workdir: str
+) -> list[str]:
+    """Download and safely extract sandbox archives into a submission directory.
+
+    Plain paths are retained for trusted local-development submissions. Remote
+    clients must upload their files and supply the resulting sandbox PFNs instead.
+    """
+    files: list[str] = []
+    for entry in entries:
+        if not entry.startswith(("SB:", "/S3/")):
+            files.append(entry)
+            continue
+
+        short_pfn = entry.split("|", 1)[-1]
+        if not short_pfn.startswith("/S3/"):
+            raise ValueError(f"Invalid S3 sandbox PFN: {entry}")
+        url = await settings.s3_client.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": settings.bucket_name, "Key": pfn_to_key(short_pfn)},
+            ExpiresIn=settings.url_validity_seconds,
+        )
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url)
+            response.raise_for_status()
+        with tarfile.open(
+            fileobj=io.BytesIO(response.content), mode="r:bz2"
+        ) as archive:
+            archive.extractall(workdir, filter="data")
+            files.extend(
+                os.path.join(workdir, member.name)
+                for member in archive.getmembers()
+                if member.isfile()
+            )
+    return files
+
+
+def _jdl_dict_to_submit_description(
+    jdl: dict[str, str],
+    *,
+    input_files: list[str] | None = None,
+    executable: str | None = None,
+) -> str:
     """Render a DIRAC JDL dictionary into a realistic HTCondor submit stanza."""
     values = {key: _clean_jdl_value(value) for key, value in jdl.items()}
 
-    executable = values.get("Executable") or "/bin/sh"
+    executable = executable or values.get("Executable") or "/bin/sh"
     arguments = values.get("Arguments") or ""
     job_name = values.get("JobName") or "dirac_job"
     owner = values.get("Owner") or "localuser"
@@ -216,8 +268,8 @@ def _jdl_dict_to_submit_description(jdl: dict[str, str]) -> str:
     desired_sites = values.get("DesiredSites") or ",".join(DEFAULT_DESIRED_SITES)
     required_os = values.get("REQUIRED_OS") or "rhel9"
     required_arch = values.get("REQUIRED_ARCH") or "X86_64"
-    input_files = _parse_file_list(values.get("InputSandbox", ""))
-
+    if input_files is None:
+        input_files = _parse_file_list(values.get("InputSandbox", ""))
     lines = [
         "Universe = vanilla",
         "",
@@ -296,7 +348,8 @@ async def _set_job_statuses_sql_only(
 
 
 def _condor_jobstatus_to_diracx_jobstatus(value: int) -> JobStatus:
-    """Translate HTCondor JobStatus to DiracX JobStatus:
+    """Translate HTCondor JobStatus to DiracX JobStatus.
+
     HTCondor         DiracX
     -----------      --------
     1 = IDLE     ->  WAITING
@@ -330,8 +383,8 @@ class CondorJobExecutorMonitorTask(PeriodicBaseTask):
 
     priority = Priority.BACKGROUND
     size = Size.MEDIUM
-    _enabled = _settingsExecutor.enabled
-    default_schedule = IntervalSeconds(_settingsExecutor.interval_seconds)
+    _enabled = _executor_settings.enabled
+    default_schedule = IntervalSeconds(_executor_settings.interval_seconds)
 
     async def execute(
         self,
@@ -416,10 +469,11 @@ class CondorJobExecutorTask(BaseTask):
         *,
         config: Config,
         job_db: JobDB,
+        sandbox_settings: SandboxStoreSettings,
     ) -> CondorSubmitResult:
         del config
-        schedd_name = _settingsExecutor.schedd_name
-        collector_host = _settingsExecutor.collector_host
+        schedd_name = _executor_settings.schedd_name
+        collector_host = _executor_settings.collector_host
 
         _, jobs = await job_db.search(
             parameters=["JobID"],
@@ -445,7 +499,7 @@ class CondorJobExecutorTask(BaseTask):
             raise ValueError(f"Could not decode JDL for job {self.job_id}")
 
         extracted_jdl = _jdl_to_key_value_pairs(extracted_jdl)
-        submit_description = _jdl_dict_to_submit_description(extracted_jdl)
+        values = {key: _clean_jdl_value(value) for key, value in extracted_jdl.items()}
 
         logger.info(f"HTCondor Python bindings module: {htcondor2.__file__}")
         logger.info(
@@ -467,23 +521,48 @@ class CondorJobExecutorTask(BaseTask):
                 f"Could not locate schedd '{schedd_name}' via collector '{collector_host}'"
             )
 
-        # htcondor2.Schedd doesn't accept a SecurityContext (unlike Collector), so
-        # the token must be dropped on disk for it to be picked up via SEC_TOKEN_DIRECTORY.
-        # See https://groups.google.com/a/g-groups.wisc.edu/d/msgid/htcondor-users/ZR3P278MB1259A4C86E46C96715FE6BE792B52%40ZR3P278MB1259.CHEP278.PROD.OUTLOOK.COM?utm_medium=email&utm_source=footer
-        token_dir = tempfile.mkdtemp(prefix="condor-tokens-")
-        try:
-            token_path = os.path.join(token_dir, "dirac.token")
-            with open(token_path, "w") as token_file:
-                token_file.write(os.environ["CONDOR_TOKEN"])
-            os.chmod(token_path, 0o600)
-            htcondor2.param["SEC_TOKEN_DIRECTORY"] = token_dir
+        with tempfile.TemporaryDirectory(
+            prefix=f"diracx-condor-{self.job_id}-"
+        ) as workdir:
+            input_files = await _materialise_input_sandbox(
+                _parse_file_list(values.get("InputSandbox", "")),
+                sandbox_settings,
+                workdir,
+            )
+            if _executor_settings.proxy_path:
+                input_files.append(_executor_settings.proxy_path)
 
-            schedd = htcondor2.Schedd(schedd_ad)
-            submit = htcondor2.Submit(submit_description)
-            result = schedd.submit(submit, spool=True)
-            schedd.spool(result)
-        finally:
-            shutil.rmtree(token_dir, ignore_errors=True)
+            # Condor flattens transferred paths, so ambiguous basenames cannot be used.
+            by_name: dict[str, str] = {}
+            for path in input_files:
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(f"Condor input file does not exist: {path}")
+                name = os.path.basename(path)
+                if name in by_name and by_name[name] != path:
+                    raise ValueError(f"Duplicate Condor input filename: {name}")
+                by_name[name] = path
+            executable = values.get("Executable") or "/bin/sh"
+            executable = by_name.get(os.path.basename(executable), executable)
+            submit_description = _jdl_dict_to_submit_description(
+                extracted_jdl, input_files=list(by_name.values()), executable=executable
+            )
+
+            # Schedd uses SEC_TOKEN_DIRECTORY; Collector uses SecurityContext above.
+            token_dir = tempfile.mkdtemp(prefix="condor-tokens-")
+            try:
+                token_path = os.path.join(token_dir, "dirac.token")
+                with open(token_path, "w") as token_file:
+                    token_file.write(os.environ["CONDOR_TOKEN"])
+                os.chmod(token_path, 0o600)
+                htcondor2.param["SEC_TOKEN_DIRECTORY"] = token_dir
+
+                schedd = htcondor2.Schedd(schedd_ad)
+                submit = htcondor2.Submit(submit_description)
+                result = schedd.submit(submit, spool=True)
+                # Keep the extracted files alive until spooling to the schedd finishes.
+                schedd.spool(result)
+            finally:
+                shutil.rmtree(token_dir, ignore_errors=True)
         cluster_id = result.cluster()
         logger.info(
             f"Job {self.job_id} submitted to HTCondor with cluster ID {cluster_id}"
@@ -501,10 +580,12 @@ class CondorJobExecutorTask(BaseTask):
         job_logging_db: JobLoggingDB,
         task_queue_db: TaskQueueDB,
         job_parameters_db: JobParametersDB,
+        sandbox_settings: SandboxStoreSettings,
     ) -> int:
         logger.info("Submitting job %d to HTCondor", self.job_id)
-        submission = await self.submit_to_condor(config=config, job_db=job_db)
-        target = submission.schedd_name or _settingsExecutor.schedd_name
+        submission = await self.submit_to_condor(
+            config=config, job_db=job_db, sandbox_settings=sandbox_settings
+        )
         application_status = f"{submission.cluster_id}.{submission.proc_id}"
         logger.warning(
             "Applying SQL-only Matched status transition for job %d (OpenSearch disabled)",
@@ -546,12 +627,12 @@ class CondorJobExecutorTask(BaseTask):
 
 @dataclasses.dataclass
 class CondorJobStatusCollectorMonitorTask(PeriodicBaseTask):
-    """Monitor all jobs HTCondor statuses"""
+    """Monitor all jobs' HTCondor statuses."""
 
     priority = Priority.BACKGROUND
     size = Size.SMALL
-    _enabled = _settingsStatusCollector.enabled
-    default_schedule = IntervalSeconds(_settingsStatusCollector.interval_seconds)
+    _enabled = _status_collector_settings.enabled
+    default_schedule = IntervalSeconds(_status_collector_settings.interval_seconds)
 
     async def execute(
         self,
@@ -591,8 +672,8 @@ class CondorJobStatusCollectorTask(BaseTask):
         *,
         job_db: JobDB,
     ) -> int:
-        schedd_name = _settingsStatusCollector.schedd_name
-        collector_host = _settingsStatusCollector.collector_host
+        schedd_name = _status_collector_settings.schedd_name
+        collector_host = _status_collector_settings.collector_host
 
         _, statuses = await job_db.search(
             parameters=["JobID", "ApplicationStatus"],
