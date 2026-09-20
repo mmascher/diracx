@@ -17,6 +17,7 @@ dependencies = [
     "diracx-db",
     "diracx-logic",
     "fastapi>=0.121.0",
+    "httpx",
     "redis[hiredis]",
     "msgpack",
     "opentelemetry-api",
